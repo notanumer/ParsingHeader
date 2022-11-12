@@ -1,16 +1,15 @@
-
-
 using System;
+using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Mvc.ModelBinding.Binders;
 using Microsoft.AspNetCore.Mvc.ModelBinding.Metadata;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
+
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -53,23 +52,74 @@ public class CustomHeaderModelBinder : IModelBinder
             throw new ArgumentNullException(nameof(bindingContext));
         }
 
-        var headerKey = bindingContext.ModelMetadata.BinderModelName;
-        if (string.IsNullOrEmpty(headerKey))
+        var headerName = bindingContext.FieldName;
+        var headerValueProvider = GetHeaderValueProvider(headerName, bindingContext);
+        var isTopLevelObject = bindingContext.IsTopLevelObject;
+        ModelBindingResult result;
+        using (bindingContext.EnterNestedScope(
+                bindingContext.ModelMetadata,
+                fieldName: bindingContext.FieldName,
+                modelName: bindingContext.ModelName,
+                model: bindingContext.Model))
         {
+            bindingContext.IsTopLevelObject = isTopLevelObject;
+            bindingContext.ValueProvider = headerValueProvider;
+
             await InnerModelBinder.BindModelAsync(bindingContext);
+            result = bindingContext.Result;
         }
 
-        bindingContext.HttpContext.Request.Headers.TryGetValue(headerKey, out var headerValue);
-        var modelType = bindingContext.ModelMetadata.ModelType;
-        if (!string.IsNullOrEmpty(headerValue))
+        bindingContext.Result = result;
+    }
+
+    private CustomHeaderValueProvider GetHeaderValueProvider(string headerName, ModelBindingContext bindingContext)
+    {
+        var request = bindingContext.HttpContext.Request;
+
+        var values = Array.Empty<string>();
+        if (request.Headers.ContainsKey(headerName))
         {
-            var result = headerValue
-                .SelectMany(x => x.Split(new[] { ' ', ','}, StringSplitOptions.RemoveEmptyEntries))
-                .ToArray();
-            bindingContext.Model = result;
-            bindingContext.Result = ModelBindingResult.Success(bindingContext.Model);
+            if (bindingContext.ModelMetadata.IsEnumerableType)
+            {
+                values = request.Headers[headerName]
+                    .SelectMany(x => x.Split(new[] { ' ', ',' }, StringSplitOptions.RemoveEmptyEntries))
+                    .ToArray();
+            }
+            else
+            {
+                values = new[] { (string)request.Headers[headerName] };
+            }
         }
-        await Task.CompletedTask;
+        return new CustomHeaderValueProvider(values);
+    }
+
+    private class CustomHeaderValueProvider : IValueProvider
+    {
+        private readonly string[] _values;
+
+        public CustomHeaderValueProvider(string[] values)
+        {
+            Debug.Assert(values != null);
+
+            _values = values;
+        }
+
+        public bool ContainsPrefix(string prefix)
+        {
+            return _values.Length != 0;
+        }
+
+        public ValueProviderResult GetValue(string key)
+        {
+            if (_values.Length == 0)
+            {
+                return ValueProviderResult.None;
+            }
+            else
+            {
+                return new ValueProviderResult(_values, CultureInfo.InvariantCulture);
+            }
+        }
     }
 }
 
@@ -83,17 +133,30 @@ public class CustomHeaderModelBinderProvider : IModelBinderProvider
             throw new ArgumentNullException(nameof(context));
         }
 
-        var x = context.Metadata as DefaultModelMetadata;
-        var headerAttribute = x.Attributes.Attributes
-            .Where(a => a.GetType() == typeof(FromHeaderAttribute))
-            .FirstOrDefault();
-        if (headerAttribute != null)
+        var bindingInfo = context.BindingInfo;
+        if (bindingInfo.BindingSource == null ||
+            !bindingInfo.BindingSource.CanAcceptDataFrom(BindingSource.Header))
         {
-            var loggerFactory = context.Services.GetRequiredService<ILoggerFactory>();
-            return new CustomHeaderModelBinder(new HeaderModelBinder(loggerFactory));
+            return null;
         }
 
-        return null;
+        var modelMetadata = context.Metadata; 
+
+        var nestedBindingInfo = new BindingInfo(bindingInfo)
+        {
+            BindingSource = BindingSource.ModelBinding
+        };
+
+        var innerModelBinder = context.CreateBinder(
+                modelMetadata.GetMetadataForType(modelMetadata.ModelType),
+                nestedBindingInfo);
+
+        if (innerModelBinder == null)
+        {
+            return null;
+        }
+
+        return new CustomHeaderModelBinder(innerModelBinder);
     }
 }
 

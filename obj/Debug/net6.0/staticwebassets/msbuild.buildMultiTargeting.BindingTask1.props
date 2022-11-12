@@ -1,0 +1,3 @@
+﻿<Project>
+  <Import Project="..\build\BindingTask1.props" />
+</Project>
